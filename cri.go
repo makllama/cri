@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -763,8 +764,30 @@ func createPodStatusFromCRI(p *CRIPod) *v1.PodStatus {
 	}
 	startTime := metav1.NewTime(time.Unix(0, p.status.CreatedAt))
 	return &v1.PodStatus{
-		Phase:             phase,
-		Conditions:        []v1.PodCondition{},
+		Phase: phase,
+		// XXX: Condition decides the final phase of ReplicaSet
+		Conditions: []v1.PodCondition{
+			{
+				Type:               v1.PodInitialized,
+				Status:             v1.ConditionTrue,
+				LastTransitionTime: metav1.Now(),
+			},
+			{
+				Type:               v1.PodReady,
+				Status:             v1.ConditionTrue,
+				LastTransitionTime: metav1.Now(),
+			},
+			{
+				Type:               v1.ContainersReady,
+				Status:             v1.ConditionTrue,
+				LastTransitionTime: metav1.Now(),
+			},
+			{
+				Type:               v1.PodScheduled,
+				Status:             v1.ConditionTrue,
+				LastTransitionTime: metav1.Now(),
+			},
+		},
 		Message:           "",
 		Reason:            "",
 		HostIP:            "",
@@ -778,6 +801,27 @@ func createPodStatusFromCRI(p *CRIPod) *v1.PodStatus {
 func createPodSpecFromCRI(p *CRIPod, nodeName string) *v1.Pod {
 	cSpecs, _ := createContainerSpecsFromCRI(p.containers)
 
+	name := p.status.Metadata.Name
+	idx := strings.LastIndex(name, "-")
+	// XXX: Currently, we only support ReplicaSet
+	if idx == -1 {
+		return &v1.Pod{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Pod",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: p.status.Metadata.Namespace,
+			},
+		}
+	}
+
+	generateName := name[:idx+1]
+	ownerReferenceName := name[:idx]
+
+	blockOwnerDeletion := true
+
 	// TODO: Fill out more fields here
 	podSpec := v1.Pod{
 		TypeMeta: metav1.TypeMeta{
@@ -785,11 +829,23 @@ func createPodSpecFromCRI(p *CRIPod, nodeName string) *v1.Pod {
 			APIVersion: "v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      p.status.Metadata.Name,
+			Name:      name,
 			Namespace: p.status.Metadata.Namespace,
 			// ClusterName:       TODO: What is this??
 			UID:               types.UID(p.status.Metadata.Uid),
 			CreationTimestamp: metav1.NewTime(time.Unix(0, p.status.CreatedAt)),
+			// New for ReplicaSet
+			Labels:       p.status.Labels,
+			GenerateName: generateName,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         "apps/v1",
+					BlockOwnerDeletion: &blockOwnerDeletion,
+					Kind:               "ReplicaSet",
+					Name:               ownerReferenceName,
+					UID:                types.UID(p.status.Metadata.Uid),
+				},
+			},
 		},
 		Spec: v1.PodSpec{
 			NodeName:   nodeName,
@@ -821,12 +877,30 @@ func (p *Provider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
 	return pods, nil
 }
 
+func getKernelVersion() (string, error) {
+	cmd := exec.Command("uname", "-r")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
 func (p *Provider) ConfigureNode(ctx context.Context, n *v1.Node) {
 	n.Status.Capacity = p.capacity(ctx)
 	n.Status.Conditions = p.nodeConditions()
 	n.Status.Addresses = p.nodeAddresses()
 	n.Status.DaemonEndpoints = p.nodeDaemonEndpoints()
 	n.Status.NodeInfo.OperatingSystem = p.operatingSystem
+	kv, err := getKernelVersion()
+	if err == nil {
+		n.Status.NodeInfo.KernelVersion = kv
+	}
+	os, err := getOSImage()
+	if err == nil {
+		n.Status.NodeInfo.OSImage = os
+	}
+	n.Status.NodeInfo.ContainerRuntimeVersion = "containerd://2.0.0"
 }
 
 // Provider function to return the capacity of the node
